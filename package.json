@@ -22,10 +22,10 @@
   "author": "Holepunch",
   "dependencies": {
     "b4a": "^1.6.7",
-    "bare-daemon": "^1.2.4",
+    "bare-daemon": "^1.2.5",
     "bare-events": "^2.9.1",
     "bare-file-logger": "^1.2.3",
-    "bare-format": "^1.0.2",
+    "bare-format": "^1.0.3",
     "bare-fs": "^4.7.4",
     "bare-os": "^3.9.3",
     "bare-path": "^3.1.1",
@@ -81,7 +81,7 @@
   "devDependencies": {
     "@hyperswarm/secret-stream": "^6.9.1",
     "@hyperswarm/testnet": "^3.1.4",
-    "bare-build": "^1.0.4",
+    "bare-build": "^1.6.2",
     "bare-env": "^3.0.0",
     "bare-runtime": "^1.30.3",
     "brittle": "^4.0.0",
