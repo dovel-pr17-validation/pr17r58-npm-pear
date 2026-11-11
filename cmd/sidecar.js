@@ -1,0 +1,68 @@
+'use strict'
+const context = require('../context')
+const path = require('bare-path')
+const fs = require('bare-fs')
+const fsx = require('fs-native-extensions')
+const gracedown = require('pear-gracedown')
+const { isWindows } = require('which-runtime')
+const { print, ansi, stdio, isTTY } = require('../lib/terminal.js')
+const constants = require('../constants.js')
+const { upgrade: key, version } = require('../package.json')
+module.exports = async function sidecar(cmd) {
+  const ipc = context.getIPC()
+  if (!isWindows && isTTY) {
+    gracedown(() => {
+      stdio.out.write('\x1B[1K\x1B[G')
+    })
+  }
+  print('Closing any current Sidecar clients...', 0)
+  const restarts = await withTimeout(ipc.closeClients(), 8000, [])
+  const n = restarts.length
+  if (n > 0) print(`${n} client${n === 1 ? '' : 's'} closed`, true)
+  print('Shutting down current Sidecar...', 0)
+  await withTimeout(ipc.shutdown(), 8000)
+  const lockFd = fs.openSync(constants.PLATFORM_LOCK, 'a+')
+  try {
+    await fsx.waitForLock(lockFd)
+  } finally {
+    fs.closeSync(lockFd)
+  }
+  print('Sidecar has shutdown', true)
+  if (cmd.command.name === 'shutdown') return
+
+  print('Rebooting current process as Sidecar', 0)
+  print('Runtime: ' + path.basename(constants.RUNTIME), 0)
+  print('\n========================= INIT ===================================\n')
+
+  constants.SPINDOWN_TIMEOUT = Number.MAX_SAFE_INTEGER // keep-alive
+  require('../sidecar')
+
+  print('\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n')
+  print('Current process is now Sidecar', true)
+  print(ansi.gray(JSON.stringify({ version, key }, 0, 4)))
+  if (restarts.length > 0) {
+    print('Restart Commands:', 0)
+    for (const { cmdArgs = [] } of restarts) {
+      stdio.out.write('  ')
+      print(ansi.gray('pear ' + cmdArgs.join(' ')), 0)
+    }
+  }
+
+  print('\n========================= RUN ====================================\n')
+}
+
+async function withTimeout(promise, ms, fallback = undefined) {
+  let timer = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms)
+      })
+    ])
+  } catch {
+    return fallback
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}

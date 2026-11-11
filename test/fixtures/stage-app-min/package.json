@@ -1,0 +1,22 @@
+{
+  "name": "stage-app-min",
+  "version": "1.0.1",
+  "pear": {
+    "name": "stage-app-min",
+    "gui": {
+      "main": "index.html"
+    },
+    "stage": {
+      "entrypoints": [
+        "/app.js"
+      ],
+      "ignore": [
+        "package-lock.json"
+      ]
+    }
+  },
+  "dependencies": {
+    "ready-resource": "^1.2.0",
+    "uncaughts": "^1.1.1"
+  }
+}

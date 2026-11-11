@@ -1,0 +1,16 @@
+{
+  "name": "app-with-ignore",
+  "pear": {
+    "name": "app-with-ignore",
+    "stage": {
+      "ignore": [
+        ".git",
+        "**all-ignore.js",
+        "ignore-file.js",
+        "ignore-dir1/*-file.*",
+        "package-lock.json",
+        "ignore-dir2/"
+      ]
+    }
+  }
+}

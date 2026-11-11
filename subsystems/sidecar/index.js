@@ -1,0 +1,429 @@
+'use strict'
+const path = require('bare-path')
+const ReadyResource = require('ready-resource')
+const HyperDHT = require('hyperdht')
+const Hyperswarm = require('hyperswarm')
+const safetyCatch = require('safety-catch')
+const PearRuntimeUpdater = require('pear-runtime-updater')
+const IPC = require('pear-ipc')
+const { isWindows } = require('which-runtime')
+const plink = require('pear-link')
+const hypercoreid = require('hypercore-id-encoding')
+const crypto = require('hypercore-crypto')
+const Hyperdrive = require('hyperdrive')
+const { parse } = require('../../lib/link.js')
+const { version } = require('../../package.json')
+const { SOCKET_PATH, SPINDOWN_TIMEOUT, KNOWN_NODES_LIMIT, UPGRADE } = require('../../constants.js')
+const Replicator = require('./lib/replicator')
+const HyperDB = require('hyperdb')
+const db = require('./lib/db')
+const ops = {
+  GC: require('./ops/gc'),
+  Stage: require('./ops/stage'),
+  Seed: require('./ops/seed'),
+  Provision: require('./ops/provision'),
+  Dump: require('./ops/dump'),
+  Info: require('./ops/info'),
+  Identity: require('./ops/identity'),
+  Touch: require('./ops/touch'),
+  Data: require('./ops/data'),
+  Multisig: require('./ops/multisig'),
+  Cores: require('./ops/cores'),
+  BlindRelay: require('./ops/blind-relay'),
+  BlindPeer: require('./ops/blind-peer')
+}
+
+const SWARM_DELAY = 5000
+const CHECKMARK = isWindows ? '^' : '✔'
+
+class Sidecar extends ReadyResource {
+  static Updater = PearRuntimeUpdater
+
+  spindownt = null
+  spindownms = SPINDOWN_TIMEOUT
+  decomissioned = false
+  swarm = null
+  keyPair = null
+
+  teardown() {
+    global.Bare.exit()
+  }
+
+  constructor({ updater, corestore, nodes }) {
+    super()
+
+    global.sidecar = this
+
+    const rocks = HyperDB.rocks(
+      path.join(path.dirname(path.dirname(corestore.storage.path)), 'db'),
+      db.spec
+    )
+    this.db = {
+      model: new db.Model(rocks)
+    }
+
+    this.updater = updater
+    if (this.updater) this.#bindUpdaterEvents(updater)
+
+    this.#spindownCountdown()
+
+    this.corestore = corestore
+    this.activeBlindRelay = null
+    this.activeBlindPeer = null
+    this.nodes = nodes
+    this.relayPublicKey = null
+    this.ipc = new IPC.Server({
+      handlers: this,
+      socketPath: SOCKET_PATH
+    })
+
+    this.ipc.on('client', (client) => {
+      client.once('close', () => {
+        if (client.clock <= 0) {
+          LOG.info(
+            'sidecar',
+            'Unresponsive non-app process detected with closed client id ' + client.id
+          )
+          return
+        }
+        this.#spindownCountdown()
+      })
+    })
+
+    this.replicator = updater ? new Replicator(updater.drive) : null
+
+    this.lazySwarmTimeout = setTimeout(() => {
+      // We defer the ready incase the sidecar is immediately killed afterwards
+      if (this.closed) return
+      this.ready().catch((err) => LOG.error('internal', 'Failed to Open Sidecar', err))
+    }, SWARM_DELAY)
+  }
+
+  async _open() {
+    await this.db.model.ready()
+    await this.#ensureSwarm()
+    LOG.info('sidecar', '- Sidecar Booted')
+  }
+
+  get clients() {
+    return this.ipc.clients
+  }
+
+  get hasClients() {
+    return this.ipc?.hasClients || false
+  }
+
+  #spindownCountdown() {
+    clearTimeout(this.spindownt)
+    if (this.decomissioned) return
+    if (this.hasClients) return
+    this.spindownt = setTimeout(() => {
+      if (this.hasClients || this.updater?.updating) return
+      this.close().catch((err) => {
+        LOG.error('internal', 'Failed to Close Sidecar', err)
+      })
+    }, this.spindownms)
+  }
+
+  updateNotify(version) {
+    LOG.info('sidecar', 'Platform update available. Restart to update to:')
+    LOG.info('sidecar', ' ' + plink.serialize({ drive: version }))
+
+    this.spindownms = 0
+    this.#spindownCountdown()
+  }
+
+  stage(params, client) {
+    return new ops.Stage(params, client, this)
+  }
+
+  seed(params, client) {
+    return new ops.Seed(params, client, this)
+  }
+
+  provision(params, client) {
+    return new ops.Provision(params, client, this)
+  }
+
+  dump(params, client) {
+    return new ops.Dump(params, client, this)
+  }
+
+  info(params, client) {
+    return new ops.Info(params, client, this)
+  }
+
+  identity(params, client) {
+    return new ops.Identity(params, client, this)
+  }
+
+  data(params, client) {
+    return new ops.Data(params, client, this)
+  }
+
+  gc(params, client) {
+    return new ops.GC(params, client, this)
+  }
+
+  touch(params, client) {
+    return new ops.Touch(params, client, this)
+  }
+
+  cores(params, client) {
+    return new ops.Cores(params, client, this)
+  }
+
+  blindRelay(params, client) {
+    return new ops.BlindRelay(params, client, this)
+  }
+
+  relay({ publicKey }) {
+    this.relayPublicKey = publicKey
+  }
+
+  versions(params, client) {
+    const runtimes = { bare: Bare.versions.bare, pear: version }
+    const fork = Number.isFinite(this.updater?.drive?.core?.fork)
+      ? this.updater.drive.core.fork
+      : null
+    const length = Number.isFinite(this.updater?.drive?.core?.length)
+      ? this.updater.drive.core.length
+      : null
+    return {
+      platform: { key: UPGRADE, version, fork, length },
+      runtimes
+    }
+  }
+
+  blindPeer(params, client) {
+    return new ops.BlindPeer(params, client, this)
+  }
+
+  multisig(params, client) {
+    return new ops.Multisig(params, client, this)
+  }
+
+  shutdown(params, client) {
+    return this.#shutdown(client)
+  }
+
+  async isWritable(params, client) {
+    const link = params.link
+    if (!link) return false
+    const info = await this.corestore.storage.getInfo(crypto.discoveryKey(parse(link).drive.key))
+    return Boolean(info?.auth.keyPair)
+  }
+
+  // the links of the metadata core of the app or apps named name, their content core follows from it
+  async getLinksByName(params, client) {
+    const name = params.name
+    const links = []
+    const contentLinks = new Set()
+
+    for await (const discoveryKey of this.corestore.list()) {
+      const info = await this.corestore.storage.getInfo(discoveryKey)
+      const key = info.auth.key
+      links.push(plink.serialize(key))
+      const contentKey = info.auth.manifest
+        ? Hyperdrive.getContentKey(info.auth.manifest, key)
+        : null
+      if (contentKey) contentLinks.add(plink.serialize(contentKey))
+    }
+
+    const result = []
+    for (const link of links) {
+      if (contentLinks.has(link)) continue // content cores hold no package.json
+      if ((await this.#getName(link)) === name) result.push(link)
+    }
+
+    return result
+  }
+
+  async #getName(link) {
+    const store = this.getCorestore()
+    await store.ready()
+    const drive = new Hyperdrive(store, parse(link).drive.key)
+    try {
+      await drive.ready()
+      const buffer = await drive.get('/package.json', { wait: false })
+      if (buffer === null) return null
+      const pkg = JSON.parse(buffer)
+      return pkg?.name || null
+    } catch (err) {
+      LOG.trace('sidecar', 'unable to read name', { link, err })
+      return null
+    } finally {
+      await drive.close()
+    }
+  }
+
+  #endRPCStreams(client) {
+    // TODO: instead of client._rpc collect src and dst streams in sidecar, do push(null) on src stream, listen for close on dst stream
+    const streams = client._rpc._handlers
+      .flatMap((m) => m?._streams)
+      .filter((m) => m?.destroyed === false)
+    return Promise.all(
+      streams.map(
+        (stream) =>
+          new Promise((resolve) => {
+            stream.once('close', resolve)
+            stream.end()
+          })
+      )
+    )
+  }
+
+  closeClients(params = {}, originClient) {
+    if (this.hasClients === false) return []
+    const metadata = []
+
+    for (const client of this.clients.toSorted((a, b) => b.at - a.at)) {
+      if (client === originClient) continue
+
+      if (client.userData?.state) {
+        const { cmdArgs } = client.userData.state
+        metadata.push({ cmdArgs })
+      }
+
+      this.#endRPCStreams(client).then(() => client.close())
+    }
+
+    return metadata
+  }
+
+  async #ensureSwarm() {
+    try {
+      await this.corestore.ready()
+    } catch (err) {
+      err.code = 'ERR_OPEN'
+      throw err
+    }
+    if (this.nodes) LOG.info('sidecar', 'DHT bootstrap set', this.nodes)
+    const knownNodes = await this.db.model.getDhtNodes()
+    const nodes = this.nodes ? undefined : knownNodes
+    if (nodes) {
+      LOG.info('dht', '- DHT known-nodes read from database ' + nodes.length + ' nodes')
+      LOG.trace('dht', nodes.map((node) => `  - ${node.host}:${node.port}`).join('\n'))
+    }
+
+    this.keyPair = await this.corestore.createKeyPair('holepunch')
+    this.dhtKeyPair = await this.corestore.createKeyPair('holepunch/dht')
+    this.blindRelayKeyPair = await this.corestore.createKeyPair('holepunch/blind-relay')
+
+    this.dht = new HyperDHT({ keyPair: this.dhtKeyPair, bootstrap: this.nodes, nodes })
+
+    this.swarm = new Hyperswarm({
+      dht: this.dht,
+      keyPair: this.keyPair,
+      relayThrough: (force) => (force || this.dht.randomized ? this.relayPublicKey : null)
+    })
+    this.swarm.once('close', () => {
+      this.swarm = null
+    })
+    this.swarm.on('connection', (connection) => {
+      this.corestore.replicate(connection)
+    })
+    if (this.replicator !== null) {
+      this.replicator.join(this.swarm, { server: false, client: true }).catch(safetyCatch)
+    }
+  }
+
+  getCorestore(opts) {
+    return this.corestore.session({ writable: false, ...opts })
+  }
+
+  blindPeerPath() {
+    return path.join(path.dirname(path.dirname(this.corestore.storage.path)), 'blind-peer')
+  }
+
+  async #shutdown(client) {
+    LOG.info('sidecar', '- Sidecar Shutting Down...')
+    await this.#endRPCStreams(client).then(() => client.close())
+    this.spindownms = 0
+    this.closeClients()
+    this.#spindownCountdown()
+    await this.closing
+  }
+
+  async #close() {
+    clearTimeout(this.lazySwarmTimeout)
+    if (this.replicator) await this.replicator.leave(this.swarm)
+    if (this.swarm) {
+      if (!this.nodes) {
+        const knownNodes = this.swarm.dht.toArray({ limit: KNOWN_NODES_LIMIT })
+        if (knownNodes.length) {
+          await this.db.model.setDhtNodes(knownNodes)
+          LOG.info('dht', '- DHT known-nodes wrote to database ' + knownNodes.length + ' nodes')
+          LOG.trace('dht', knownNodes.map((node) => `  - ${node.host}:${node.port}`).join('\n'))
+        }
+      }
+      await this.swarm.destroy()
+      await this.dht.destroy()
+    }
+    await this.db.model.close()
+    if (this.corestore) await this.corestore.close()
+    LOG.info('sidecar', CHECKMARK + ' Sidecar Closed')
+  }
+
+  #bindUpdaterEvents(updater) {
+    updater.on('updating', () => {
+      const key = hypercoreid.normalize(updater.key)
+      const currentKey = UPGRADE ? hypercoreid.normalize(UPGRADE) : null
+      const length = updater.drive.core.length
+      LOG.info(
+        'sidecar',
+        key === currentKey
+          ? `- Updating to length ${length}...`
+          : `- Switching to key ${key || 'unknown'} with length ${length}...`
+      )
+    })
+
+    updater.on('updated', () => this.updateNotify({ key: updater.key, length: updater.length }))
+
+    updater.on('error', (err) => {
+      LOG.error('sidecar', 'Updater error', err)
+    })
+  }
+
+  async _close() {
+    if (this.decomissioned) return
+    this.decomissioned = true
+    for (const client of this.clients.toSorted((a, b) => b.at - a.at)) {
+      // TODO: can teardown be respected here?
+      await this.#endRPCStreams(client)
+    }
+    // point of no return, death-march ensues
+    this.deathClock()
+    const closing = this.#close()
+    this.closeClients()
+    await closing
+    await this.ipc.close()
+
+    if (this.updater) {
+      if (this.updater.updated) {
+        await this.updater.applyUpdate()
+        LOG.info('sidecar', CHECKMARK + ' Applied update')
+      }
+      await this.updater.close()
+    }
+  }
+
+  deathClock(ms = 20000) {
+    clearTimeout(this.bailout)
+    this.bailout = setTimeout(async () => {
+      if (this.updater) {
+        try {
+          await this.updater.applyUpdate()
+          LOG.info('sidecar', CHECKMARK + ' Applied update')
+        } catch (err) {
+          LOG.error('sidecar', err)
+        }
+      }
+
+      LOG.error('internal', 'DEATH CLOCK TRIGGERED, FORCE KILLING. EXIT CODE 124')
+      Bare.exit(124) // timeout
+    }, ms).unref()
+  }
+}
+
+module.exports = Sidecar

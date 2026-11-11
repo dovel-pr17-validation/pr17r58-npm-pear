@@ -1,0 +1,11 @@
+{
+  "name": "versions",
+  "main": "index.js",
+  "pear": {
+    "name": "versions",
+    "type": "terminal"
+  },
+  "dependencies": {
+    "pear-pipe": "^1.0.1"
+  }
+}

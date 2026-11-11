@@ -1,0 +1,16 @@
+node_modules
+preloads
+prebuilds
+boot.bundle
+by-arch
+pear.new.dev
+pear.new.exe
+pear/current
+*.log
+.DS_Store
+*.tmp
+/assets/
+out/
+
+examples/desktop/package-lock.json
+examples/terminal/package-lock.json

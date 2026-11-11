@@ -1,0 +1,185 @@
+'use strict'
+const fs = require('bare-fs')
+const hypercoreid = require('hypercore-id-encoding')
+const clog = require('pear-changelog')
+const semifies = require('semifies')
+const plink = require('pear-link')
+const Hyperdrive = require('hyperdrive')
+const { ERR_INVALID_INPUT } = require('pear-errors')
+const { UPGRADE } = require('../../../constants.js')
+const platformPkg = require('../../../package.json')
+const platformChangelog = fs.readFileSync(require.asset('../../../CHANGELOG.md', __filename))
+const Opstream = require('../lib/opstream')
+const Replicator = require('../lib/replicator')
+const { parse } = require('../../../lib/link')
+
+module.exports = class Info extends Opstream {
+  constructor(...args) {
+    super((...args) => this.#op(...args), ...args)
+  }
+
+  async #op({ link, showKey, metadata, manifest, multisig, changelog = null } = {}) {
+    const { session } = this
+    let { full = false, max = 10, semver = '^*' } = changelog ?? {}
+    if (full) max = Infinity
+
+    const enabledFlags = new Set(
+      [full, metadata, showKey, multisig].filter((value) => value === true)
+    )
+
+    const isEnabled = (flag) => (enabledFlags.size > 0 ? !!flag : !flag)
+
+    const corestore = this.sidecar.getCorestore()
+    const key = link ? parse(link).drive.key : plink.parse(UPGRADE).drive.key
+    const drive = await session.add(new Hyperdrive(corestore, key))
+
+    if (isEnabled(showKey)) {
+      const onlyShowKey = enabledFlags.size === 1
+      this.push({ tag: 'retrieving', data: { link: plink.serialize(drive.key), onlyShowKey } })
+    }
+
+    await this.sidecar.ready()
+    if (link) {
+      const replicator = await session.add(new Replicator(drive))
+      await replicator.join(this.sidecar.swarm, { server: false, client: true })
+    }
+
+    if (link && drive.core.length === 0) {
+      await drive.core.update()
+    }
+
+    if (link && drive.core.length === 0 && drive.core.fork === 0) {
+      this.push({ tag: 'empty' })
+      return
+    }
+
+    if (link === null || drive.core.length > 0) {
+      const pkg = link ? JSON.parse(await drive.get('./package.json')) : platformPkg
+      if (manifest) {
+        this.push({ tag: 'manifest', data: { manifest: pkg } })
+        this.final = { manifest: pkg }
+        return
+      }
+
+      const coreManifest = drive.core.manifest
+      const isMultisig = coreManifest !== null && coreManifest.signers.length > 1
+      if (multisig && !isMultisig) throw ERR_INVALID_INPUT('Link has no multisig signers')
+
+      if (isEnabled(metadata)) {
+        this.push({
+          tag: 'keys',
+          data: {
+            project: hypercoreid.encode(drive.key),
+            content: drive.contentKey ? hypercoreid.encode(drive.contentKey) : null,
+            discovery: hypercoreid.encode(drive.discoveryKey)
+          }
+        })
+      }
+
+      if (isEnabled(metadata)) {
+        const name = pkg?.pear?.name || pkg?.name
+        const version = pkg?.version
+        const productName = pkg?.productName
+        const upgrade = pkg?.upgrade
+        const writable = Boolean((await corestore.storage.getInfo(drive.discoveryKey)).auth.keyPair)
+        const length = drive.core.length
+        const byteLength = drive.core.byteLength
+        const blobs = drive.blobs
+          ? {
+              key: hypercoreid.encode(drive.blobs.core.key),
+              length: drive.blobs.core.length,
+              fork: drive.blobs.core.fork,
+              byteLength: drive.blobs.core.byteLength
+            }
+          : null
+        const fork = drive.core.fork
+        const verlink = plink.serialize({ drive: { key, fork, length } })
+        const targets = []
+        for await (const platform of drive.readdir('/by-arch/')) {
+          let size = 0
+          for await (const { value } of drive.list('/by-arch/' + platform + '/')) {
+            if (value?.blob) size += await drive.blobs.getByteLength(value.blob)
+          }
+          targets.push({ platform, size })
+        }
+        this.push({
+          tag: 'info',
+          data: {
+            link,
+            verlink,
+            name,
+            version,
+            productName,
+            upgrade,
+            writable,
+            length,
+            byteLength,
+            blobs,
+            fork,
+            targets
+          }
+        })
+      }
+
+      if (isEnabled(multisig) && isMultisig) {
+        const publicKeys = coreManifest.signers.map((s) => hypercoreid.encode(s.publicKey))
+        this.push({
+          tag: 'multisig',
+          data: { quorum: coreManifest.quorum, publicKeys, only: !!multisig }
+        })
+        if (multisig) return
+      }
+    }
+
+    if (!changelog) return
+
+    const contents = link === null ? platformChangelog : await drive.get('/CHANGELOG.md')
+    const blank = '[ No Changelog ]'
+    const parsed = clog.parse(contents)
+    const top = parsed[0]?.[0]
+    if (top && semver === '^*') {
+      if (full) {
+        semver = '*'
+      } else {
+        let major = top.split(' ')[0].split('.')[0]
+        if (major[0] === 'v') major = major.slice(1)
+        semver = major.split('.')[0] + '.x.x'
+      }
+    }
+
+    const entries = parsed
+      .filter(([version]) => {
+        version = version.split(' ')[0]
+        if (version[0] === 'v') version = version.slice(1)
+        return semifies(version, semver)
+      })
+      .slice(0, max)
+      .reverse()
+
+    let count = 0
+    for (const [version, entry] of entries) {
+      this.push({
+        tag: 'changelog',
+        data: {
+          version,
+          changelog: entry,
+          index: count++,
+          max
+        }
+      })
+      if (count === max) break
+    }
+
+    if (count === 0) {
+      this.push({
+        tag: 'changelog',
+        data: {
+          version: null,
+          changelog: blank,
+          index: count,
+          max
+        }
+      })
+    }
+  }
+}

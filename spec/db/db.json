@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "offset": 0,
+  "schema": [
+    {
+      "name": "dht",
+      "namespace": "pear",
+      "id": 0,
+      "type": 1,
+      "version": 1,
+      "versionField": null,
+      "indexes": [],
+      "schema": "@pear/dht",
+      "derived": false,
+      "key": [],
+      "trigger": null
+    },
+    {
+      "name": "multisig",
+      "namespace": "pear",
+      "id": 1,
+      "type": 1,
+      "version": 2,
+      "versionField": null,
+      "indexes": [],
+      "schema": "@pear/multisig",
+      "derived": false,
+      "key": ["key"],
+      "trigger": null
+    }
+  ]
+}

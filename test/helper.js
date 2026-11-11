@@ -1,0 +1,399 @@
+'use strict'
+const os = require('bare-os')
+const env = require('bare-env')
+const path = require('bare-path')
+const { spawn } = require('bare-subprocess')
+const { spawn: daemon } = require('bare-daemon')
+const fs = require('bare-fs')
+const { isWindows } = require('which-runtime')
+const IPC = require('pear-ipc')
+const sodium = require('sodium-native')
+const Corestore = require('corestore')
+const Hyperdrive = require('hyperdrive')
+const Hyperswarm = require('hyperswarm')
+const LocalDrive = require('localdrive')
+const plink = require('pear-link')
+const b4a = require('b4a')
+const OUT = path.join('out', 'make', `pear${isWindows ? '.exe' : ''}`)
+
+const constants = require('../constants.js')
+const { PLATFORM_DIR } = constants
+const NO_GC = Bare.argv.includes('--no-tmp-gc')
+const MAX_OP_STEP_WAIT = env.CI ? 360000 : 120000
+const { cmdArgs } = require('../argv')
+const tmp = fs.realpathSync(os.tmpdir())
+Error.stackTraceLimit = Infinity
+
+const DHT_BOOTSTRAP = env.PEAR_TEST_BOOTSTRAP
+  ? env.PEAR_TEST_BOOTSTRAP.split(',').map((addr) => {
+      const [host, port] = addr.split(':')
+      return { host, port: +port }
+    })
+  : []
+
+class OperationError extends Error {
+  constructor({ code, message, stack }) {
+    super(message)
+    this.code = code
+    this.sidecarStack = stack
+  }
+}
+
+class Helper extends IPC.Client {
+  static fixture(name) {
+    return path.join(Helper.localDir, 'test', 'fixtures', name)
+  }
+  static setupPeers = setupPeers
+  static setupDestPeers = setupDestPeers
+  static makePwd = makePwd
+  static tmp = tmp
+  static PLATFORM_DIR = PLATFORM_DIR
+  static dhtBootstrap = DHT_BOOTSTRAP
+  static OUT = OUT
+  // DO NOT UNDER ANY CIRCUMSTANCES ADD PUBLIC METHODS OR PROPERTIES TO HELPER (see pear-ipc)
+  constructor(opts = {}) {
+    const logging = cmdArgs.filter((arg) => arg.startsWith('--log-level'))
+    const log = logging.length > 0
+    const runtime = opts.platformDir
+      ? path.resolve(opts.platformDir, '..', OUT)
+      : isWindows || fs.existsSync(path.join(Helper.localDir, OUT))
+        ? path.join(Helper.localDir, OUT)
+        : path.join(Helper.localDir, 'pear.dev')
+    const dhtBootstrap = DHT_BOOTSTRAP.map((e) => `${e.host}:${e.port}`).join(',')
+    const args = ['--sidecar', '--dht-bootstrap', dhtBootstrap, ...logging]
+    const pipeId = (s) => {
+      const buf = b4a.allocUnsafe(32)
+      sodium.crypto_generichash(buf, b4a.from(s))
+      return b4a.toString(buf, 'hex')
+    }
+
+    const platformDir = opts.platformDir ?? path.join(Helper.localDir, 'pear')
+    const lock = path.join(platformDir, 'pear.lock')
+    const socketPath = isWindows
+      ? `\\\\.\\pipe\\pear-${pipeId(platformDir)}`
+      : `${platformDir}/pear.sock`
+    const connectTimeout = 20_000
+    const connect = opts.expectSidecar
+      ? true
+      : () => {
+          this.child = log ? spawn(runtime, args, { stdio: 'inherit' }) : daemon(runtime, args)
+        }
+    super({ lock, socketPath, connectTimeout, connect })
+    this.log = log
+    this.runtime = runtime
+  }
+
+  static getRandomId() {
+    const buf = Buffer.alloc(32)
+    sodium.randombytes_buf(buf)
+    return buf.toString('hex')
+  }
+
+  static async touchLink(helper) {
+    const touching = await helper.touch()
+    const until = await Helper.pick(touching, [{ tag: 'final' }])
+    const { link } = await until.final
+    return link
+  }
+
+  static teardownStream(stream) {
+    if (stream.destroyed) return
+    stream.end()
+    return new Promise((resolve) => stream.on('close', resolve))
+  }
+
+  // seeds a drive, pkg is written to /package.json when set
+  static async createDrive(t, { pkg = null } = {}) {
+    const store = new Corestore(await t.tmp())
+    t.teardown(() => store.close())
+    await store.ready()
+
+    const drive = new Hyperdrive(store)
+    await drive.ready()
+    if (pkg !== null) await drive.put('/package.json', Buffer.from(JSON.stringify(pkg)))
+    await drive.put('/index.js', Buffer.from('module.exports = true'))
+
+    const swarm = new Hyperswarm({ bootstrap: DHT_BOOTSTRAP })
+    t.teardown(() => swarm.destroy())
+    swarm.on('connection', (connection) => store.replicate(connection))
+    const topic = swarm.join(drive.discoveryKey, { server: true, client: false })
+    await topic.flushed()
+
+    return {
+      link: plink.serialize({ drive: { key: drive.key } }),
+      content: plink.serialize({ drive: { key: drive.blobs.core.key } })
+    }
+  }
+
+  // pulls a seeded drive into the platform corestore
+  static async cacheDrive(t, helper, link) {
+    const dumping = helper.dump({ link, dir: await t.tmp() })
+    t.teardown(() => Helper.teardownStream(dumping))
+    const result = await Helper.pick(dumping, [{ tag: 'final' }])
+    await result.final
+  }
+
+  // ONLY ADD STATICS, NEVER ADD PUBLIC METHODS OR PROPERTIES (see pear-ipc)
+  static localDir = path.dirname(__dirname)
+
+  static async pick(stream, ptn = {}, by = 'tag') {
+    if (Array.isArray(ptn)) return this.#untils(stream, ptn, by)
+    for await (const output of stream) {
+      if (ptn?.[by] !== 'error' && output[by] === 'error') throw new OperationError(output.data)
+      if (this.matchesPattern(output, ptn)) return output.data
+    }
+    return null
+  }
+
+  static #untils(stream, patterns = [], by) {
+    const untils = {}
+    for (const ptn of patterns) {
+      untils[ptn[by]] = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(
+            new Error(
+              'Helper: Data Timeout for ' +
+                JSON.stringify(ptn) +
+                ' after ' +
+                MAX_OP_STEP_WAIT +
+                'ms'
+            )
+          )
+        }, MAX_OP_STEP_WAIT)
+        const onclose = () => reject(new Error('Helper: Unexpected close on stream'))
+        const onerror = (err) => reject(err)
+        const ondata = (data) => {
+          if (data === null || data?.tag === 'final') stream.off('close', onclose)
+        }
+        stream.on('data', ondata)
+        stream.on('close', onclose)
+        stream.on('error', onerror)
+        const onpick = (data) => {
+          const result = data === undefined ? true : data
+          resolve(result)
+        }
+        this.pick(new Reiterate(stream), ptn, by)
+          .then(onpick, reject)
+          .finally(() => {
+            clearTimeout(timeout)
+            stream.off('data', ondata)
+            stream.off('close', onclose)
+            stream.off('error', onerror)
+          })
+      })
+    }
+    return untils
+  }
+
+  static async sink(stream) {
+    for await (const output of stream) {
+      if (output.tag === 'error') throw new Error(output.data?.stack)
+    }
+  }
+
+  static matchesPattern(message, pattern) {
+    if (typeof pattern !== 'object' || pattern === null) return false
+    for (const key in pattern) {
+      if (Object.hasOwnProperty.call(pattern, key) === false) continue
+      if (Object.hasOwnProperty.call(message, key) === false) return false
+      const messageValue = message[key]
+      const patternValue = pattern[key]
+      const nested =
+        typeof patternValue === 'object' &&
+        patternValue !== null &&
+        typeof messageValue === 'object' &&
+        messageValue !== null
+      if (nested) {
+        if (!this.matchesPattern(messageValue, patternValue)) return false
+      } else if (messageValue !== patternValue) {
+        return false
+      }
+    }
+    return true
+  }
+
+  static async gc(dir) {
+    if (NO_GC) return
+    await fs.promises.rm(dir, { recursive: true }).catch(() => {})
+  }
+
+  static async untilExit(child) {
+    if (child.once) return new Promise((resolve) => child.once('exit', resolve))
+    while (true) {
+      try {
+        os.kill(child.pid, 0)
+      } catch {
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  }
+}
+
+class Rig {
+  artefactDir = Helper.localDir
+  tmp = tmp
+
+  constructor(opts = {}) {
+    this.localDir = opts.dir || path.join(tmp, 'rig-pear')
+    this.platformDir = opts.platformDir || path.join(this.localDir, 'pear')
+    this.artefactDir = opts.artefactDir || Helper.localDir
+  }
+
+  setup = async ({ comment = () => {}, timeout = () => {}, cleanFirst = true } = {}) => {
+    timeout(180000)
+
+    if (cleanFirst && fs.existsSync(this.localDir)) {
+      comment('cleaning up existing rig platform directory...')
+      await Helper.gc(this.localDir)
+    }
+
+    comment('preparing rig platform...')
+    const runtime = path.join(this.artefactDir, OUT)
+
+    if (fs.existsSync(runtime)) {
+      comment('using existing platform runtime...')
+      const bin = path.join(this.localDir, OUT)
+      await fs.promises.mkdir(path.dirname(bin), { recursive: true })
+      await fs.promises.cp(runtime, bin)
+    } else {
+      comment('building rig platform runtime...')
+      await fs.promises.mkdir(this.localDir, { recursive: true })
+
+      await new LocalDrive(this.artefactDir)
+        .mirror(new LocalDrive(this.localDir), {
+          prune: false,
+          ignore: ['/pear', '/.git', '/test', '/out']
+        })
+        .done()
+
+      const build = spawn(isWindows ? 'npm.cmd' : 'npm', ['run', `make`], {
+        cwd: this.localDir,
+        stdio: 'ignore'
+      })
+
+      await new Promise((resolve) => build.once('exit', resolve))
+    }
+    comment('rig platform prepared')
+  }
+
+  cleanup = async ({ comment = () => {} } = {}) => {
+    await Helper.gc(this.localDir)
+    comment('rig sidecar cleaned up')
+  }
+}
+
+Helper.Rig = Rig
+
+module.exports = Helper
+
+class Reiterate {
+  constructor(stream) {
+    this.stream = stream
+    this.complete = false
+    this.buffer = []
+    this.readers = []
+
+    this._ondata = this._ondata.bind(this)
+    this._onend = this._onend.bind(this)
+    this.onerror = this._onerror.bind(this)
+
+    this.stream.on('data', this._ondata)
+    this.stream.on('end', this._onend)
+    this.stream.on('error', this._onerror)
+  }
+
+  _ondata(value) {
+    this.buffer.push({ value, done: false })
+    for (const { resolve } of this.readers) resolve()
+    this.readers.length = 0
+  }
+
+  _onend() {
+    this.buffer.push({ done: true })
+    this.complete = true
+    for (const { resolve } of this.readers) resolve()
+    this.readers.length = 0
+  }
+
+  _onerror(err) {
+    for (const { reject } of this.readers) reject(err)
+    this.readers.length = 0
+  }
+
+  async *_tail() {
+    try {
+      let i = 0
+      while (i < this.buffer.length || !this.complete) {
+        if (i < this.buffer.length) {
+          const { value, done } = this.buffer[i++]
+          if (done) break
+          yield value
+        } else {
+          await new Promise((resolve, reject) => this.readers.push({ resolve, reject }))
+        }
+      }
+    } finally {
+      this.stream.off('data', this._ondata)
+      this.stream.off('end', this._onend)
+      this.stream.off('error', this._onerror)
+    }
+  }
+
+  [Symbol.asyncIterator]() {
+    return this._tail()
+  }
+}
+
+function makePwd(str) {
+  const buf = sodium.sodium_malloc(Buffer.byteLength(str))
+  buf.write(str)
+  return buf
+}
+
+async function setupDestPeers(dbKey, blobsKey, n, teardown, tmp) {
+  for (let i = 0; i < n; i++) {
+    const store = new Corestore(await tmp())
+    teardown(() => store.close())
+    await store.ready()
+    const dbCore = store.get({ key: dbKey })
+    const blobsCore = store.get({ key: blobsKey })
+    await Promise.all([dbCore.ready(), blobsCore.ready()])
+    dbCore.download({ start: 0, end: -1 })
+    blobsCore.download({ start: 0, end: -1 })
+
+    const swarm = new Hyperswarm({ bootstrap: Helper.dhtBootstrap })
+    teardown(() => swarm.destroy())
+    swarm.on('connection', (conn) => store.replicate(conn))
+    const topic = swarm.join(dbCore.discoveryKey, { server: true, client: false })
+    await topic.flushed()
+  }
+}
+
+async function setupPeers(key, n, teardown, tmp) {
+  for (let i = 0; i < n; i++) {
+    const store = new Corestore(await tmp())
+    teardown(() => store.close())
+    await store.ready()
+    const drive = new Hyperdrive(store, key)
+    await drive.ready()
+
+    const dlSwarm = new Hyperswarm({ bootstrap: Helper.dhtBootstrap })
+    const done = store.findingPeers()
+    dlSwarm.on('connection', (conn) => drive.corestore.replicate(conn))
+    dlSwarm.join(drive.discoveryKey)
+    await dlSwarm.flush()
+    await drive.db.core.update()
+    done()
+    await drive.db.core.download({ start: 0, end: drive.db.core.length }).done()
+    await drive.download().done()
+    await drive.blobs.core.download({ start: 0, end: drive.blobs.core.length }).done()
+    await dlSwarm.destroy()
+
+    const serverSwarm = new Hyperswarm({ bootstrap: Helper.dhtBootstrap })
+    teardown(() => serverSwarm.destroy())
+    serverSwarm.on('connection', (conn) => drive.corestore.replicate(conn))
+    const topic = serverSwarm.join(drive.discoveryKey, { server: true, client: false })
+    await topic.flushed()
+  }
+}

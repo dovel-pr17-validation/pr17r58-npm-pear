@@ -1,0 +1,94 @@
+'use strict'
+const Corestore = require('corestore')
+const fs = require('bare-fs')
+const fsx = require('fs-native-extensions')
+const Rache = require('rache')
+const setupCrashHandlers = require('./lib/crasher.js')
+const gracedown = require('pear-gracedown')
+const os = require('bare-os')
+const pear = require('./lib/cmd').command
+const path = require('bare-path')
+const {
+  GC,
+  PLATFORM_CORESTORE,
+  PLATFORM_DIR,
+  PLATFORM_LOCK,
+  LOCALDEV,
+  UPGRADE
+} = require('./constants.js')
+
+const { version, productName, upgrade } = require('./package.json')
+const { cmdArgs } = require('./argv')
+
+setupCrashHandlers('sidecar')
+
+os.setProcessTitle('pear-sidecar')
+LOG.info('sidecar', '- Sidecar Booting')
+module.exports = bootSidecar().catch((err) => {
+  LOG.error('internal', 'Sidecar Boot Failed', err)
+  Bare.exit(1)
+})
+async function gc() {
+  try {
+    await fs.promises.rm(GC, { recursive: true })
+  } catch {}
+  await fs.promises.mkdir(GC, { recursive: true })
+}
+
+async function bootSidecar() {
+  await gc()
+
+  const maxCacheSize = 65536
+  const globalCache = new Rache({ maxSize: maxCacheSize })
+  const nodes = pear(
+    cmdArgs.filter((arg) => arg !== 'sidecar'),
+    { bails: true }
+  )
+    .flags.dhtBootstrap?.split(',')
+    .map((tuple) => {
+      const [host, port] = tuple.split(':')
+      const int = +port
+      if (Number.isInteger(int) === false) throw new Error(`Invalid port: ${port}`)
+      return { host, port: int }
+    })
+
+  const corestore = new Corestore(PLATFORM_CORESTORE, {
+    globalCache,
+    manifestVersion: 1,
+    compat: false,
+    wait: true
+  })
+  await corestore.ready()
+
+  const lockFd = fs.openSync(PLATFORM_LOCK, 'a+')
+  if (!fsx.tryLock(lockFd)) throw new Error('Sidecar already running')
+
+  const Sidecar = require('./subsystems/sidecar/index.js')
+  const updater = createUpdater()
+  if (updater) await updater.ready()
+
+  const sidecar = new Sidecar({
+    updater,
+    corestore,
+    nodes
+  })
+  gracedown(() => sidecar.close())
+  await sidecar.ipc.ready()
+
+  function createUpdater() {
+    if (LOCALDEV || !upgrade) return null
+    const app = os.execPath()
+    if (!app) return null
+
+    const name = path.basename(app) || productName || 'pear'
+
+    return new Sidecar.Updater({
+      dir: PLATFORM_DIR,
+      store: corestore,
+      version,
+      upgrade: UPGRADE,
+      app,
+      name
+    })
+  }
+}

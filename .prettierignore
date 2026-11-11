@@ -1,0 +1,7 @@
+test/fixtures
+init/templates
+out/
+examples
+pear
+by-arch
+*.md
